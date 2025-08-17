@@ -1,0 +1,124 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "DHT.h"
+
+// ---------- WiFi ----------
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// ---------- Device ----------
+const char* DEVICE_ID = "manhole-001";
+
+// ---------- Server ----------
+const char* SERVER_HOST = "http://YOUR_SERVER_IP:5000"; // Replace with your server address
+const unsigned long POST_INTERVAL_MS = 30000; // 30s interval
+
+// ---------- Pins ----------
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define MQ135_PIN 34
+#define FLOAT_PIN 25   // Active LOW if water present
+#define TILT_PIN 26    // Active LOW if tilted
+#define DHT_PIN 4
+#define DHTTYPE DHT22
+
+DHT dht(DHT_PIN, DHTTYPE);
+
+// ---------- Thresholds ----------
+const float LEVEL_ALERT_CM = 15.0;    // Water too close to cover
+const int   GAS_RAW_ALERT = 2500;     // Raw ADC threshold for MQ-135
+
+// ---------- Helpers ----------
+float readUltrasonicCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000UL);
+  if (duration == 0) return -1;
+  float distance_cm = (duration / 2.0) * 0.0343;
+  return distance_cm;
+}
+
+int readMQ135Raw() {
+  return analogRead(MQ135_PIN); // Raw ADC value (0–4095)
+}
+
+void ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi Connected: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi failed.");
+  }
+}
+
+void postJSON(const String& json) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = String(SERVER_HOST) + "/api/telemetry";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(json);
+  Serial.print("POST -> ");
+  Serial.println(code);
+  http.end();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(FLOAT_PIN, INPUT_PULLUP);
+  pinMode(TILT_PIN, INPUT_PULLUP);
+  dht.begin();
+  ensureWiFi();
+}
+
+void loop() {
+  ensureWiFi();
+
+  float level_cm = readUltrasonicCM();
+  int gas_raw = readMQ135Raw();
+  bool water_present = (digitalRead(FLOAT_PIN) == LOW);
+  bool tilt = (digitalRead(TILT_PIN) == LOW);
+  float temp_c = dht.readTemperature();
+  float hum = dht.readHumidity();
+
+  // Alerts
+  bool alert = false;
+  String alert_msg = "";
+  if (level_cm > 0 && level_cm <= LEVEL_ALERT_CM) { alert = true; alert_msg += "High water level; "; }
+  if (gas_raw >= GAS_RAW_ALERT) { alert = true; alert_msg += "High gas; "; }
+  if (water_present) { alert = true; alert_msg += "Water present; "; }
+  if (tilt) { alert = true; alert_msg += "Cover tilted; "; }
+
+  // JSON payload
+  String json = "{";
+  json += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
+  json += "\"level_cm\":" + String(level_cm, 1) + ",";
+  json += "\"gas_raw\":" + String(gas_raw) + ",";
+  json += "\"water_present\":" + String(water_present ? 1 : 0) + ",";
+  json += "\"tilt\":" + String(tilt ? 1 : 0) + ",";
+  json += "\"temp_c\":" + String(isnan(temp_c) ? -1000.0 : temp_c, 1) + ",";
+  json += "\"hum\":" + String(isnan(hum) ? -1.0 : hum, 1) + ",";
+  json += "\"alert\":" + String(alert ? 1 : 0) + ",";
+  json += "\"alert_msg\":\"" + alert_msg + "\"";
+  json += "}";
+
+  Serial.println(json);
+  postJSON(json);
+
+  delay(POST_INTERVAL_MS);
+}
